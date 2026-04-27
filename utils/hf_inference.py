@@ -9,7 +9,14 @@ import requests
 
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
+LOCAL_LLM_CHAT_URL = os.getenv(
+    "LOCAL_LLM_CHAT_URL",
+    "http://43.156.67.61:1234/v1/chat/completions",
+)
+LM_STUDIO_BASE_URL = os.getenv(
+    "LOCAL_LLM_BASE_URL",
+    os.getenv("LM_STUDIO_BASE_URL", LOCAL_LLM_CHAT_URL.rsplit("/chat/completions", 1)[0]),
+)
 
 
 def make_client(api_key: str | None):
@@ -86,15 +93,13 @@ def collect_chat_completion(
 
     if _is_lmstudio:
         response = requests.post(
-            f"{LM_STUDIO_BASE_URL}/chat/completions",
+            LOCAL_LLM_CHAT_URL,
             headers={"Content-Type": "application/json"},
             json={
-                "model": model,
                 "messages": messages,
                 "temperature": temperature,
                 "top_p": top_p,
                 "max_tokens": max_tokens,
-                "stream": False,
             },
             timeout=180,
         )

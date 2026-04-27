@@ -24,8 +24,20 @@ HF_FALLBACK_MODELS = [
     {"id": "mistralai/Mistral-Nemo-Instruct-2407", "label": "Mistral Nemo Instruct", "free": True, "vision": False, "notes": "fast"},
 ]
 
-LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
-LM_STUDIO_MODELS_DIR = Path(os.getenv("LM_STUDIO_MODELS_DIR", str(Path.home() / ".lmstudio" / "models")))
+LOCAL_LLM_CHAT_URL = os.getenv(
+    "LOCAL_LLM_CHAT_URL",
+    "http://43.156.67.61:1234/v1/chat/completions",
+)
+LM_STUDIO_BASE_URL = os.getenv(
+    "LOCAL_LLM_BASE_URL",
+    os.getenv("LM_STUDIO_BASE_URL", LOCAL_LLM_CHAT_URL.rsplit("/chat/completions", 1)[0]),
+)
+LM_STUDIO_MODELS_DIR = Path(
+    os.getenv(
+        "LOCAL_LLM_MODELS_DIR",
+        os.getenv("LM_STUDIO_MODELS_DIR", str(Path.home() / ".lmstudio" / "models")),
+    )
+)
 
 
 def _scan_lmstudio_models_dir() -> list[dict[str, Any]]:
@@ -89,12 +101,19 @@ def validate_hf_token(api_key: str) -> tuple[bool, str]:
 
 def validate_lmstudio_endpoint(_: str = "") -> tuple[bool, str]:
     try:
-        response = requests.get(f"{LM_STUDIO_BASE_URL}/models", timeout=10)
+        response = requests.post(
+            LOCAL_LLM_CHAT_URL,
+            json={
+                "messages": [{"role": "user", "content": "ping"}],
+                "temperature": 0.0,
+            },
+            timeout=15,
+        )
         if response.status_code == 200:
-            return True, "LM Studio local API is reachable."
-        return False, f"LM Studio responded with status {response.status_code}."
+            return True, "Local LLM chat endpoint is reachable."
+        return False, f"Local LLM responded with status {response.status_code}."
     except Exception as exc:
-        return False, f"LM Studio is not reachable at {LM_STUDIO_BASE_URL}: {exc}"
+        return False, f"Local LLM is not reachable at {LOCAL_LLM_CHAT_URL}: {exc}"
 
 
 def fetch_openrouter_models(api_key: str | None) -> list[dict[str, Any]]:
@@ -184,7 +203,8 @@ def render_model_selector(
         if hf_key:
             st.session_state[f"{key_prefix}_hf_key"] = hf_key
 
-    st.caption(f"LM Studio endpoint: `{LM_STUDIO_BASE_URL}`")
+    st.caption(f"Local model endpoint: `{LOCAL_LLM_CHAT_URL}`")
+    st.caption(f"Local model directory: `{LM_STUDIO_MODELS_DIR}`")
 
     val_col1, val_col2, val_col3 = st.columns(3)
     with val_col1:
@@ -198,7 +218,7 @@ def render_model_selector(
             st.session_state[f"{key_prefix}_hf_valid"] = ok
             (st.success if ok else st.error)(msg)
     with val_col3:
-        if st.button("Validate LM Studio", key=f"{key_prefix}_val_lmstudio", use_container_width=True):
+        if st.button("Validate Local Server", key=f"{key_prefix}_val_lmstudio", use_container_width=True):
             ok, msg = validate_lmstudio_endpoint()
             st.session_state[f"{key_prefix}_lmstudio_valid"] = ok
             (st.success if ok else st.error)(msg)

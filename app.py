@@ -36,6 +36,7 @@ from utils.evaluation import (
 from utils.hf_inference import collect_chat_completion
 from utils.model_selector_local import (
     LM_STUDIO_BASE_URL,
+    LOCAL_LLM_CHAT_URL,
     render_model_selector,
     validate_hf_token,
     validate_lmstudio_endpoint,
@@ -192,6 +193,8 @@ def _run_evaluation_script(
         env["HF_TOKEN"] = api_key
     elif provider == "lmstudio":
         env["LM_STUDIO_BASE_URL"] = LM_STUDIO_BASE_URL
+        env["LOCAL_LLM_BASE_URL"] = LM_STUDIO_BASE_URL
+        env["LOCAL_LLM_CHAT_URL"] = LOCAL_LLM_CHAT_URL
 
     return subprocess.run(
         command,
