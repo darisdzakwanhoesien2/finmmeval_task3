@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import inspect
+import os
 from collections.abc import Generator
 from typing import Any, Optional
 
-from huggingface_hub import InferenceClient
+import requests
 
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
 
 
-def make_client(api_key: str | None) -> InferenceClient:
+def make_client(api_key: str | None):
+    from huggingface_hub import InferenceClient
+
     return InferenceClient(api_key=api_key)
 
 
@@ -37,6 +41,8 @@ def stream_chat_completion(
     provider: Optional[str] = None,
 ) -> Generator[str, None, None]:
     """Stream chat completion tokens from a Hugging Face hosted model."""
+    from huggingface_hub import InferenceClient
+
     client = InferenceClient(model=model, token=api_key)
 
     supported_params = inspect.signature(client.chat_completion).parameters
@@ -76,14 +82,34 @@ def collect_chat_completion(
         provider == "openrouter"
         or ":" in model
     )
+    _is_lmstudio = provider == "lmstudio"
+
+    if _is_lmstudio:
+        response = requests.post(
+            f"{LM_STUDIO_BASE_URL}/chat/completions",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_tokens": max_tokens,
+                "stream": False,
+            },
+            timeout=180,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
 
     if _is_openrouter:
         import sys
+        import inspect as _inspect
         from pathlib import Path
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
         from shared.model_provider import call_chat_completion as _or_call
-        # ← use model_id=, not model= (matches model_provider.py signature)
-        return _or_call(
+
+        kwargs: dict[str, Any] = dict(
             messages=messages,
             model_id=model,
             provider="openrouter",
@@ -91,8 +117,10 @@ def collect_chat_completion(
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
-            pre_call_delay=pre_call_delay,
         )
+        if "pre_call_delay" in _inspect.signature(_or_call).parameters and pre_call_delay is not None:
+            kwargs["pre_call_delay"] = pre_call_delay
+        return _or_call(**kwargs)
 
     # --- HuggingFace path ---
     return "".join(

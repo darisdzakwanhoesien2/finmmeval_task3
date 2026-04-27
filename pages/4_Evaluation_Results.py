@@ -8,8 +8,11 @@ import streamlit as st
 
 from utils.evaluation import (
     build_dataset_analysis_frame,
+    generate_results_discussion,
     list_saved_runs,
+    load_run_summary,
     load_saved_results,
+    save_run_report,
     summarize_performance_metrics,
 )
 
@@ -69,6 +72,7 @@ else:
 
     selected_run = st.selectbox("Select run", runs["run_name"].tolist())
     results = load_saved_results(selected_run)
+    run_summary = load_run_summary(selected_run)
 
     performance = summarize_performance_metrics(results)
 
@@ -160,3 +164,29 @@ else:
         summary_json_path = Path(run_path) / "summary.json"
         if summary_json_path.exists():
             st.code(json.dumps(json.loads(summary_json_path.read_text(encoding="utf-8")), indent=2), language="json")
+
+    st.subheader("Results and Discussion")
+    report_key = f"results_discussion::{selected_run}"
+    if st.button("Generate Results and Discussion", key=f"generate_discussion::{selected_run}"):
+        report_markdown = generate_results_discussion(
+            run_name=selected_run,
+            results=results,
+            run_summary=run_summary,
+        )
+        report_path = save_run_report(selected_run, report_markdown)
+        st.session_state[report_key] = {
+            "markdown": report_markdown,
+            "path": str(report_path),
+        }
+
+    if report_key in st.session_state:
+        report = st.session_state[report_key]
+        st.caption(f"Saved to `{report['path']}`")
+        st.markdown(report["markdown"])
+        st.download_button(
+            "Download Markdown",
+            data=report["markdown"],
+            file_name=f"{selected_run}_results_and_discussion.md",
+            mime="text/markdown",
+            key=f"download_discussion::{selected_run}",
+        )

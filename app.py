@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -9,14 +10,6 @@ import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from shared.model_selector_ui import render_model_selector          # ← NEW
-from shared.model_provider import (                                  # ← NEW
-    call_chat_completion,
-    stream_chat_completion as unified_stream,
-    validate_hf_token,
-    validate_openrouter_key,
-)
 
 from utils.data import (
     CORE_PAYLOAD_FIELDS,
@@ -32,10 +25,21 @@ from utils.data import (
 from utils.evaluation import (
     build_dataset_analysis_frame,
     evaluate_record,
+    generate_results_discussion,
     list_saved_runs,
+    load_run_summary,
     load_saved_results,
+    save_run_report,
     save_experiment_results,
     summarize_performance_metrics,
+)
+from utils.hf_inference import collect_chat_completion
+from utils.model_selector_local import (
+    LM_STUDIO_BASE_URL,
+    render_model_selector,
+    validate_hf_token,
+    validate_lmstudio_endpoint,
+    validate_openrouter_key,
 )
 
 
@@ -142,6 +146,63 @@ def _safe_secrets_get(key: str, default=None):
         return default
 
 
+def _run_evaluation_script(
+    *,
+    experiment_name: str,
+    model_id: str,
+    provider: str,
+    hf_provider_hint: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    selected_assets: list[str],
+    limit: int,
+    reruns: int,
+    api_key: str,
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / "scripts" / "run_evaluation.py"),
+        "--experiment-name",
+        experiment_name,
+        "--model",
+        model_id,
+        "--provider",
+        provider,
+        "--hf-provider-hint",
+        hf_provider_hint,
+        "--temperature",
+        str(float(temperature)),
+        "--top-p",
+        str(float(top_p)),
+        "--max-tokens",
+        str(int(max_tokens)),
+        "--reruns",
+        str(int(reruns)),
+    ]
+    if int(limit) > 0:
+        command.extend(["--limit", str(int(limit))])
+    for asset in selected_assets:
+        command.extend(["--asset", asset])
+
+    env = os.environ.copy()
+    if provider == "openrouter":
+        env["OPENROUTER_API_KEY"] = api_key
+    elif provider == "huggingface":
+        env["HF_TOKEN"] = api_key
+    elif provider == "lmstudio":
+        env["LM_STUDIO_BASE_URL"] = LM_STUDIO_BASE_URL
+
+    return subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parent,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 api_key = _safe_secrets_get("HF_TOKEN", None) or st.session_state.get("hf_token") or os.getenv("HF_TOKEN")
 normalized_dataset = build_normalized_dataset()
 asset_options = sorted(normalized_dataset["asset"].unique().tolist()) if not normalized_dataset.empty else []
@@ -189,8 +250,10 @@ if validate_clicked:
         with st.spinner("Validating..."):
             if provider == "openrouter":
                 is_valid, message = validate_openrouter_key(api_key)
-            else:
+            elif provider == "huggingface":
                 is_valid, message = validate_hf_token(api_key)
+            else:
+                is_valid, message = validate_lmstudio_endpoint()
         st.session_state["home_token_valid"] = is_valid
         (st.success if is_valid else st.error)(message)
 
@@ -292,7 +355,7 @@ with tab_playground:
     if not asset_options:
         st.warning("No dataset rows are available.")
     else:
-        st.caption("Run a single hosted completion in streaming mode — OpenRouter or HuggingFace.")
+        st.caption("Run a single completion in streaming mode or local mode — OpenRouter, HuggingFace, or LM Studio.")
 
         # model / provider now come from the shared selector above — show a reminder
         st.info(f"Using **{model_id}** via **{provider}**. Change in the ⚙️ settings above.")
@@ -338,7 +401,7 @@ with tab_playground:
             st.code(json.dumps(record["request_payload"], ensure_ascii=False, indent=2, default=str), language="json")
 
         if st.button("Stream response", type="primary", key="app_playground_run"):
-            if not api_key:
+            if provider != "lmstudio" and not api_key:
                 st.error("Provide an API key or token first.")
             else:
                 messages = [
@@ -346,17 +409,15 @@ with tab_playground:
                     {"role": "user",   "content": user_prompt},
                 ]
                 try:
-                    streamed_text = st.write_stream(
-                        unified_stream(                      # ← unified provider-aware stream
-                            messages=messages,
-                            model_id=model_id,
-                            provider=provider,
-                            api_key=api_key,
-                            max_tokens=int(max_tokens),
-                            temperature=float(temperature),
-                            top_p=float(top_p),
-                            hf_provider_hint=hf_provider_hint,
-                        )
+                    streamed_text = collect_chat_completion(
+                        api_key=api_key,
+                        model=model_id,
+                        messages=messages,
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        max_tokens=int(max_tokens),
+                        provider=provider,
+                        hf_provider_hint=hf_provider_hint,
                     )
                     st.session_state["app_last_model_response"] = streamed_text
                 except Exception as exc:
@@ -395,6 +456,24 @@ with tab_batch:
         f"`{len(preview_dataset) * int(reruns)}` model calls"
     )
     st.dataframe(preview_dataset[["dataset_row_id", "date", "asset", "prices", "news_count", "news_length"]].head(10), hide_index=True)
+
+    st.markdown("**Execution mode**")
+    st.caption("Use the script runner for the complete research flow, or the in-app runner for checkpointed interactive execution.")
+
+    script_col, interactive_col = st.columns(2)
+    with script_col:
+        script_run_clicked = st.button(
+            "Run via scripts/run_evaluation.py",
+            type="primary",
+            use_container_width=True,
+            key="app_batch_run_script",
+        )
+    with interactive_col:
+        interactive_run_clicked = st.button(
+            "Run inside app",
+            use_container_width=True,
+            key="app_batch_run",
+        )
 
     # ── Checkpoint resume ─────────────────────────────────────────────────────
     RESULTS_DIR = Path(__file__).resolve().parent / "results"
@@ -436,10 +515,41 @@ with tab_batch:
             checkpoint_path.unlink(missing_ok=True)
             st.success("Checkpoint cleared. Refresh the page to start fresh.")
 
-    if st.button("Run and Store Evaluation", type="primary", use_container_width=True, key="app_batch_run"):
+    if script_run_clicked:
         if normalized_dataset.empty:
             st.error("No dataset rows are available.")
-        elif not api_key:
+        elif provider != "lmstudio" and not api_key:
+            st.error("Provide an API key or token first.")
+        else:
+            with st.spinner("Running scripts/run_evaluation.py..."):
+                completed = _run_evaluation_script(
+                    experiment_name=experiment_name,
+                    model_id=model_id,
+                    provider=provider,
+                    hf_provider_hint=hf_provider_hint,
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    max_tokens=int(max_tokens),
+                    selected_assets=selected_assets or asset_options,
+                    limit=int(limit),
+                    reruns=int(reruns),
+                    api_key=api_key,
+                )
+            if completed.returncode == 0:
+                st.success("Script evaluation finished successfully.")
+                if completed.stdout.strip():
+                    st.code(completed.stdout, language="text")
+            else:
+                st.error("Script evaluation failed.")
+                if completed.stderr.strip():
+                    st.code(completed.stderr, language="text")
+                if completed.stdout.strip():
+                    st.code(completed.stdout, language="text")
+
+    if interactive_run_clicked:
+        if normalized_dataset.empty:
+            st.error("No dataset rows are available.")
+        elif provider != "lmstudio" and not api_key:
             st.error("Provide an API key or token first.")
         else:
             run_dataset = normalized_dataset.copy()
@@ -562,6 +672,7 @@ with tab_results:
         )
         selected_run = st.selectbox("Select run", runs["run_name"].tolist(), key="app_results_run")
         results = load_saved_results(selected_run)
+        run_summary = load_run_summary(selected_run)
 
         performance = summarize_performance_metrics(results)
 
@@ -624,6 +735,32 @@ with tab_results:
         if summary_json_path.exists():
             with st.expander("Summary File", expanded=False):
                 st.code(json.dumps(json.loads(summary_json_path.read_text(encoding="utf-8")), indent=2), language="json")
+
+        st.subheader("Results and Discussion")
+        report_key = f"app_results_discussion::{selected_run}"
+        if st.button("Generate Results and Discussion", key=f"app_generate_discussion::{selected_run}"):
+            report_markdown = generate_results_discussion(
+                run_name=selected_run,
+                results=results,
+                run_summary=run_summary,
+            )
+            report_path = save_run_report(selected_run, report_markdown)
+            st.session_state[report_key] = {
+                "markdown": report_markdown,
+                "path": str(report_path),
+            }
+
+        if report_key in st.session_state:
+            report = st.session_state[report_key]
+            st.caption(f"Saved to `{report['path']}`")
+            st.markdown(report["markdown"])
+            st.download_button(
+                "Download Markdown",
+                data=report["markdown"],
+                file_name=f"{selected_run}_results_and_discussion.md",
+                mime="text/markdown",
+                key=f"app_download_discussion::{selected_run}",
+            )
 
 with tab_notes:
     notes = read_notes()

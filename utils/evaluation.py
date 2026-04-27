@@ -428,6 +428,187 @@ def summarize_results(results: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def load_run_summary(run_name: str) -> dict[str, Any]:
+    run_dir = ensure_results_dir() / run_name
+    summary_path = run_dir / "summary.json"
+    if not summary_path.exists():
+        return {}
+    return json.loads(summary_path.read_text(encoding="utf-8"))
+
+
+def save_run_report(run_name: str, report_markdown: str, filename: str = "results_and_discussion.md") -> Path:
+    run_dir = ensure_results_dir() / run_name
+    report_path = run_dir / filename
+    report_path.write_text(report_markdown, encoding="utf-8")
+    return report_path
+
+
+def _format_pct(value: float | int | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{float(value):.{digits}%}"
+
+
+def _format_float(value: float | int | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{float(value):.{digits}f}"
+
+
+def generate_results_discussion(
+    *,
+    run_name: str,
+    results: pd.DataFrame,
+    run_summary: dict[str, Any] | None = None,
+) -> str:
+    if results.empty:
+        return "## Results\n\nNo rows were available for this run.\n\n## Discussion\n\nThe experiment did not produce any evaluable predictions."
+
+    run_summary = run_summary or {}
+    summary = run_summary.get("summary", {}) if run_summary else {}
+    metadata = run_summary.get("metadata", {}) if run_summary else {}
+    performance = summarize_performance_metrics(results)
+
+    by_asset = (
+        results.groupby("asset", as_index=False)
+        .agg(
+            rows=("dataset_row_id", "count"),
+            parse_success=("json_parse_success", "mean"),
+            hit_rate=("hit", "mean"),
+            mean_latency=("latency_seconds", "mean"),
+            mean_strategy_return=("strategy_return", "mean"),
+            mean_buy_hold_return=("buy_hold_return", "mean"),
+            cumulative_return=("strategy_return", lambda series: float((1 + series.dropna()).prod() - 1) if series.notna().any() else 0.0),
+        )
+        .sort_values("cumulative_return", ascending=False)
+    )
+
+    action_distribution = (
+        results["execution_action"].value_counts(normalize=True)
+        .reindex(list(VALID_ACTIONS), fill_value=0.0)
+    )
+    failure_default_rate = float(results["failure_defaulted_to_hold"].mean())
+    confidence_available = results["confidence"].dropna()
+    exact_stability = None
+    if "rerun_id" in results.columns and results["rerun_id"].nunique() > 1:
+        exact_stability = float(
+            (results.groupby("dataset_row_id")["parsed_action"].nunique() == 1).mean()
+        )
+
+    best_asset = by_asset.iloc[0] if not by_asset.empty else None
+    worst_asset = by_asset.iloc[-1] if not by_asset.empty else None
+    issues_count = int(
+        (
+            (~results["json_parse_success"])
+            | ((results["execution_action"] == "SELL") & (results["next_day_return"] > 0.03))
+            | ((results["confidence"].fillna(0) >= 0.9) & (results["hit"] == False))
+        ).sum()
+    )
+
+    lines = [
+        "## Results",
+        "",
+        f"Run `{run_name}` evaluated **{int(summary.get('rows', len(results)))}** trading instances"
+        f" using model `{metadata.get('model', results['model'].iloc[0] if 'model' in results.columns else 'N/A')}`"
+        f" via provider `{metadata.get('provider', results['provider'].iloc[0] if 'provider' in results.columns else 'N/A')}`.",
+        "",
+        f"The strategy achieved a cumulative return of **{_format_pct(performance['cumulative_return'])}**, "
+        f"with a Sharpe ratio of **{_format_float(performance['sharpe_ratio'])}**, "
+        f"max drawdown of **{_format_pct(performance['max_drawdown'])}**, "
+        f"daily volatility of **{_format_pct(performance['daily_volatility'])}**, "
+        f"and annualized volatility of **{_format_pct(performance['annualized_volatility'])}**.",
+        "",
+        f"Prediction parsing succeeded on **{_format_pct(summary.get('parse_success_rate', results['json_parse_success'].mean()), 1)}** of requests. "
+        f"The average per-row strategy return was **{_format_pct(summary.get('mean_strategy_return', results['strategy_return'].dropna().mean()))}**, "
+        f"compared with a buy-and-hold baseline of **{_format_pct(summary.get('mean_buy_hold_return', results['buy_hold_return'].dropna().mean()))}**. "
+        f"Directional hit rate was **{_format_pct(summary.get('hit_rate', results['hit'].dropna().mean() if results['hit'].notna().any() else 0.0), 1)}**.",
+        "",
+        f"Executed actions were distributed as BUY **{_format_pct(action_distribution.get('BUY', 0.0), 1)}**, "
+        f"HOLD **{_format_pct(action_distribution.get('HOLD', 0.0), 1)}**, and SELL **{_format_pct(action_distribution.get('SELL', 0.0), 1)}**. "
+        f"Failure-to-HOLD fallbacks occurred in **{_format_pct(failure_default_rate, 1)}** of rows.",
+        "",
+        "Asset-level performance summary:",
+        "",
+    ]
+
+    for _, row in by_asset.iterrows():
+        lines.append(
+            f"- `{row['asset']}`: cumulative return {_format_pct(row['cumulative_return'])}, "
+            f"mean strategy return {_format_pct(row['mean_strategy_return'])}, "
+            f"baseline {_format_pct(row['mean_buy_hold_return'])}, "
+            f"hit rate {_format_pct(row['hit_rate'], 1)}, "
+            f"parse success {_format_pct(row['parse_success'], 1)}."
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Discussion",
+            "",
+        ]
+    )
+
+    discussion_points = []
+    if best_asset is not None and worst_asset is not None:
+        discussion_points.append(
+            f"Performance was uneven across assets. The strongest asset was `{best_asset['asset']}` "
+            f"with cumulative return {_format_pct(best_asset['cumulative_return'])}, while `{worst_asset['asset']}` "
+            f"was weakest at {_format_pct(worst_asset['cumulative_return'])}."
+        )
+
+    if performance["sharpe_ratio"] > 1:
+        discussion_points.append(
+            "Risk-adjusted performance was solid, suggesting the strategy generated returns with relatively efficient volatility usage."
+        )
+    elif performance["sharpe_ratio"] > 0:
+        discussion_points.append(
+            "Risk-adjusted performance was positive but modest, which suggests the signal may contain value without yet being consistently strong."
+        )
+    else:
+        discussion_points.append(
+            "Risk-adjusted performance was weak, indicating that volatility and drawdowns outweighed the gains produced by the trading signals."
+        )
+
+    if action_distribution.get("HOLD", 0.0) >= 0.5:
+        discussion_points.append(
+            "The policy was HOLD-heavy. That usually means the system behaved conservatively, which can reduce turnover but may also mute upside capture."
+        )
+    elif action_distribution.get("BUY", 0.0) > action_distribution.get("SELL", 0.0):
+        discussion_points.append(
+            "The action mix tilted long, which may have helped in upward market phases but also makes the strategy more sensitive to bullish regime assumptions."
+        )
+    else:
+        discussion_points.append(
+            "The action mix was not dominated by long exposure, which suggests the model used both neutral and bearish positioning rather than simply echoing market drift."
+        )
+
+    if failure_default_rate > 0.1:
+        discussion_points.append(
+            f"Operational reliability remains a material concern because **{_format_pct(failure_default_rate, 1)}** of requests defaulted to HOLD after parse or request failure."
+        )
+    else:
+        discussion_points.append(
+            "Operational reliability was acceptable, with only a limited share of requests falling back to HOLD due to failure handling."
+        )
+
+    if exact_stability is not None:
+        discussion_points.append(
+            f"Across repeated runs, exact action stability was **{_format_pct(exact_stability, 1)}**, which helps indicate whether the prompting setup is reproducible or still noisy."
+        )
+
+    if not confidence_available.empty:
+        discussion_points.append(
+            f"The model reported confidence on {len(confidence_available)}/{len(results)} rows, with an average confidence of **{_format_float(confidence_available.mean())}**."
+        )
+
+    discussion_points.append(
+        f"The error-analysis shortlist contains **{issues_count}** rows worth manual inspection, especially cases with malformed outputs, failed parsing, or confidently wrong calls."
+    )
+
+    lines.extend(discussion_points)
+    return "\n".join(lines)
+
+
 def save_experiment_results(
     *,
     experiment_name: str,
